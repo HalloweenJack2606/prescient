@@ -25,6 +25,7 @@ struct ContentView: View {
     @State private var results: [GrepResult] = []
     @State private var isSearching = false
     @State private var searchTask: Task<Void, Never>?
+    @State private var currentSearchID: UUID?
 
     var body: some View {
         VStack(spacing: 12) {
@@ -35,7 +36,8 @@ struct ContentView: View {
                 searchText: $searchText,
                 isSearching: isSearching,
                 onBrowse: chooseFolder,
-                onRun: runSearch
+                onRun: runSearch,
+                onStop: stopSearch
             )
 
             ResultsTable(
@@ -47,7 +49,7 @@ struct ContentView: View {
         .padding(16)
         .frame(minWidth: 900, minHeight: 560)
         .onDisappear {
-            searchTask?.cancel()
+            stopSearch()
         }
     }
 
@@ -65,13 +67,19 @@ struct ContentView: View {
 
     private func runSearch() {
         searchTask?.cancel()
+        let searchID = UUID()
+        currentSearchID = searchID
         results = []
 
         guard !folder.isEmpty, !searchText.isEmpty else {
+            isSearching = false
+            currentSearchID = nil
             return
         }
 
         guard let folderAccess = resolvedFolderAccess() else {
+            isSearching = false
+            currentSearchID = nil
             return
         }
 
@@ -80,15 +88,33 @@ struct ContentView: View {
 
         isSearching = true
         searchTask = Task {
-            let matches = await Task.detached(priority: .userInitiated) {
-                SearchEngine.search(folder: folderAccess.url, filePatterns: filePatterns, text: needle)
-            }.value
+            let worker = Task.detached(priority: .userInitiated) {
+                await SearchEngine.search(folder: folderAccess.url, filePatterns: filePatterns, text: needle) { result in
+                    await MainActor.run {
+                        guard currentSearchID == searchID else { return }
+                        results.append(result)
+                    }
+                }
+            }
+
+            await withTaskCancellationHandler {
+                await worker.value
+            } onCancel: {
+                worker.cancel()
+            }
+
             folderAccess.stopAccessing()
 
-            guard !Task.isCancelled else { return }
-            results = matches
+            guard currentSearchID == searchID else { return }
             isSearching = false
+            currentSearchID = nil
         }
+    }
+
+    private func stopSearch() {
+        searchTask?.cancel()
+        searchTask = nil
+        isSearching = false
     }
 
     private func saveBookmark(for url: URL) {
@@ -147,6 +173,7 @@ struct SearchBar: View {
     let isSearching: Bool
     let onBrowse: () -> Void
     let onRun: () -> Void
+    let onStop: () -> Void
 
     var body: some View {
         VStack(spacing: 10) {
@@ -202,11 +229,17 @@ struct SearchBar: View {
                 }
 
                 Button(action: onRun) {
-                    Label(isSearching ? "Searching" : "Run", systemImage: "magnifyingglass")
+                    Label(isSearching ? "Searching" : "Search", systemImage: "magnifyingglass")
                         .frame(width: 100)
                 }
                 .keyboardShortcut(.return, modifiers: .command)
                 .disabled(isSearching)
+
+                Button(action: onStop) {
+                    Label("Stop", systemImage: "stop.fill")
+                        .frame(width: 76)
+                }
+                .disabled(!isSearching)
             }
         }
         .padding(12)
@@ -244,14 +277,23 @@ struct LabeledField<Content: View>: View {
 struct FilePatternFilter: Sendable {
     let includePatterns: [String]
     let excludePatterns: [String]
+    let excludeDirPatterns: [String]
     let allowsAllFiles: Bool
 
     nonisolated var grepExcludePatterns: [String] {
         excludePatterns.filter { !$0.contains("/") }
     }
 
+    nonisolated var grepExcludeDirPatterns: [String] {
+        excludeDirPatterns.filter { !$0.contains("/") }
+    }
+
     nonisolated func excludes(relativePath: String) -> Bool {
         let basename = URL(fileURLWithPath: relativePath).lastPathComponent
+
+        if isInExcludedDirectory(relativePath: relativePath) {
+            return true
+        }
 
         return excludePatterns.contains { pattern in
             if pattern.contains("/") {
@@ -263,12 +305,15 @@ struct FilePatternFilter: Sendable {
     }
 
     nonisolated static func parse(includes: String, excludes: String) -> FilePatternFilter {
+        let excludeTokens = tokens(from: excludes)
         let includePatterns = tokens(from: includes).map(normalizeInclude)
-        let excludePatterns = tokens(from: excludes).flatMap(normalizeExclude)
+        let excludePatterns = excludeTokens.flatMap(normalizeExclude)
+        let excludeDirPatterns = excludeTokens.flatMap(normalizeExcludeDirectory)
 
         return FilePatternFilter(
             includePatterns: includePatterns,
             excludePatterns: excludePatterns,
+            excludeDirPatterns: excludeDirPatterns,
             allowsAllFiles: includePatterns.isEmpty || includePatterns.contains("*") || includePatterns.contains("*.*")
         )
     }
@@ -301,6 +346,10 @@ struct FilePatternFilter: Sendable {
             return [pattern]
         }
 
+        if pattern.hasSuffix("/") {
+            return []
+        }
+
         if pattern.hasPrefix("."), !pattern.contains("*"), !pattern.contains("?"), !pattern.contains("/") {
             return ["*\(pattern)"]
         }
@@ -313,19 +362,76 @@ struct FilePatternFilter: Sendable {
         return [pattern, extensionPattern]
     }
 
+    private nonisolated static func normalizeExcludeDirectory(_ pattern: String) -> [String] {
+        let trimmedPattern = pattern.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+
+        guard !trimmedPattern.isEmpty,
+              trimmedPattern != "*",
+              trimmedPattern != "*.*" else {
+            return []
+        }
+
+        if trimmedPattern.contains("/") {
+            return [trimmedPattern]
+        }
+
+        return [trimmedPattern]
+    }
+
+    private nonisolated func isInExcludedDirectory(relativePath: String) -> Bool {
+        let components = relativePath.split(separator: "/").map(String.init)
+
+        guard components.count > 1 else {
+            return false
+        }
+
+        let directoryComponents = components.dropLast()
+
+        return excludeDirPatterns.contains { pattern in
+            if pattern.contains("/") {
+                return pathMatches(pattern: pattern, value: relativePath)
+            }
+
+            return directoryComponents.contains { component in
+                pathMatches(pattern: pattern, value: component)
+            }
+        }
+    }
+
     private nonisolated func pathMatches(pattern: String, value: String) -> Bool {
         fnmatch(pattern, value, FNM_PATHNAME) == 0
     }
 }
 
 enum SearchEngine {
-    nonisolated static func search(folder: URL, filePatterns: FilePatternFilter, text: String) -> [GrepResult] {
-        let output = runGrep(folder: folder, filePatterns: filePatterns, text: text)
-        return parse(output: output, relativeTo: folder)
-            .filter { !filePatterns.excludes(relativePath: $0.filePath) }
+    nonisolated static func search(
+        folder: URL,
+        filePatterns: FilePatternFilter,
+        text: String,
+        onResult: @escaping @Sendable (GrepResult) async -> Void
+    ) async {
+        let processBox = GrepProcessBox()
+
+        await withTaskCancellationHandler {
+            await runGrep(
+                folder: folder,
+                filePatterns: filePatterns,
+                text: text,
+                processBox: processBox,
+                onResult: onResult
+            )
+        } onCancel: {
+            processBox.terminate()
+        }
     }
 
-    private nonisolated static func runGrep(folder: URL, filePatterns: FilePatternFilter, text: String) -> String {
+    private nonisolated static func runGrep(
+        folder: URL,
+        filePatterns: FilePatternFilter,
+        text: String,
+        processBox: GrepProcessBox,
+        onResult: @escaping @Sendable (GrepResult) async -> Void
+    ) async {
         let process = Process()
         let outputPipe = Pipe()
 
@@ -336,6 +442,7 @@ enum SearchEngine {
             "-I",
             "-F",
             "-s",
+            "--line-buffered",
             "--exclude-dir=.git",
             "--exclude-dir=.build",
             "--exclude-dir=DerivedData"
@@ -346,6 +453,7 @@ enum SearchEngine {
         }
 
         arguments.append(contentsOf: filePatterns.grepExcludePatterns.map { "--exclude=\($0)" })
+        arguments.append(contentsOf: filePatterns.grepExcludeDirPatterns.map { "--exclude-dir=\($0)" })
 
         arguments.append(text)
         arguments.append(folder.path)
@@ -358,46 +466,72 @@ enum SearchEngine {
         do {
             try process.run()
         } catch {
-            return ""
+            return
         }
 
-        let data = outputPipe.fileHandleForReading.readDataToEndOfFile()
-        process.waitUntilExit()
-
-        return String(data: data, encoding: .utf8) ?? ""
-    }
-
-    private nonisolated static func parse(output: String, relativeTo folder: URL) -> [GrepResult] {
-        if output.isEmpty {
-            return []
+        processBox.set(process)
+        defer {
+            processBox.clear()
+            try? outputPipe.fileHandleForReading.close()
         }
 
-        var results: [GrepResult] = []
-        let lines = output.split(separator: "\n", omittingEmptySubsequences: false)
+        var partialLine = ""
         let folderPath = folder.standardizedFileURL.path
 
-        for line in lines {
-            let parts = line.split(separator: ":", maxSplits: 2, omittingEmptySubsequences: false)
+        while !Task.isCancelled {
+            let data = outputPipe.fileHandleForReading.availableData
 
-            guard parts.count == 3,
-                  let lineNumber = Int(parts[1]) else {
-                continue
+            if data.isEmpty {
+                break
             }
 
-            let filePath = relativePath(from: String(parts[0]), folderPath: folderPath)
-            let absoluteFilePath = String(parts[0])
+            partialLine += String(decoding: data, as: UTF8.self)
 
-            results.append(
-                GrepResult(
-                    filePath: filePath,
-                    absoluteFilePath: absoluteFilePath,
-                    line: lineNumber,
-                    text: String(parts[2])
-                )
-            )
+            while let newlineRange = partialLine.range(of: "\n") {
+                let line = String(partialLine[..<newlineRange.lowerBound])
+                partialLine.removeSubrange(...newlineRange.lowerBound)
+                await emit(line: line, folderPath: folderPath, filePatterns: filePatterns, onResult: onResult)
+            }
         }
 
-        return results
+        if !Task.isCancelled, !partialLine.isEmpty {
+            await emit(line: partialLine, folderPath: folderPath, filePatterns: filePatterns, onResult: onResult)
+        }
+
+        process.waitUntilExit()
+    }
+
+    private nonisolated static func emit(
+        line: String,
+        folderPath: String,
+        filePatterns: FilePatternFilter,
+        onResult: @escaping @Sendable (GrepResult) async -> Void
+    ) async {
+        guard let result = parse(line: line, folderPath: folderPath),
+              !filePatterns.excludes(relativePath: result.filePath) else {
+            return
+        }
+
+        await onResult(result)
+    }
+
+    private nonisolated static func parse(line: String, folderPath: String) -> GrepResult? {
+        let parts = line.split(separator: ":", maxSplits: 2, omittingEmptySubsequences: false)
+
+        guard parts.count == 3,
+              let lineNumber = Int(parts[1]) else {
+            return nil
+        }
+
+        let absoluteFilePath = String(parts[0])
+        let filePath = relativePath(from: absoluteFilePath, folderPath: folderPath)
+
+        return GrepResult(
+            filePath: filePath,
+            absoluteFilePath: absoluteFilePath,
+            line: lineNumber,
+            text: String(parts[2])
+        )
     }
 
     private nonisolated static func relativePath(from path: String, folderPath: String) -> String {
@@ -412,6 +546,35 @@ enum SearchEngine {
         }
 
         return path
+    }
+}
+
+private final class GrepProcessBox: @unchecked Sendable {
+    nonisolated private let lock = NSLock()
+    nonisolated(unsafe) private var process: Process?
+
+    nonisolated init() {}
+
+    nonisolated func set(_ process: Process) {
+        lock.lock()
+        self.process = process
+        lock.unlock()
+    }
+
+    nonisolated func terminate() {
+        lock.lock()
+        let process = process
+        lock.unlock()
+
+        if process?.isRunning == true {
+            process?.terminate()
+        }
+    }
+
+    nonisolated func clear() {
+        lock.lock()
+        process = nil
+        lock.unlock()
     }
 }
 
