@@ -43,7 +43,11 @@ struct ContentView: View {
             ResultsTable(
                 results: results,
                 folder: folder,
-                folderBookmark: folderBookmark
+                folderBookmark: folderBookmark,
+                fileFilter: $fileFilter,
+                fileExclusions: $fileExclusions,
+                searchText: searchText,
+                onRun: runSearch
             )
         }
         .padding(16)
@@ -280,12 +284,38 @@ struct FilePatternFilter: Sendable {
     let excludeDirPatterns: [String]
     let allowsAllFiles: Bool
 
+    nonisolated var grepIncludePatterns: [String] {
+        includePatterns.map { pattern in
+            if pattern.contains("/") {
+                return URL(fileURLWithPath: pattern).lastPathComponent
+            }
+
+            return pattern
+        }
+    }
+
     nonisolated var grepExcludePatterns: [String] {
         excludePatterns.filter { !$0.contains("/") }
     }
 
     nonisolated var grepExcludeDirPatterns: [String] {
         excludeDirPatterns.filter { !$0.contains("/") }
+    }
+
+    nonisolated func includes(relativePath: String) -> Bool {
+        guard !allowsAllFiles else {
+            return true
+        }
+
+        let basename = URL(fileURLWithPath: relativePath).lastPathComponent
+
+        return includePatterns.contains { pattern in
+            if pattern.contains("/") {
+                return pathMatches(pattern: pattern, value: relativePath)
+            }
+
+            return pathMatches(pattern: pattern, value: basename)
+        }
     }
 
     nonisolated func excludes(relativePath: String) -> Bool {
@@ -334,6 +364,10 @@ struct FilePatternFilter: Sendable {
             return pattern
         }
 
+        if pattern.contains("/") {
+            return pattern
+        }
+
         if pattern.contains("*") || pattern.contains("?") {
             return pattern
         }
@@ -371,6 +405,10 @@ struct FilePatternFilter: Sendable {
             return []
         }
 
+        if pattern.hasSuffix("/"), trimmedPattern.contains("/") {
+            return ["\(trimmedPattern)/*"]
+        }
+
         if trimmedPattern.contains("/") {
             return [trimmedPattern]
         }
@@ -404,6 +442,13 @@ struct FilePatternFilter: Sendable {
 }
 
 enum SearchEngine {
+    nonisolated static func grepCommand(folder: String, filePatterns: FilePatternFilter, text: String) -> String {
+        let arguments = grepArguments(folder: folder, filePatterns: filePatterns, text: text)
+        return ([URL(fileURLWithPath: "/usr/bin/grep").path] + arguments)
+            .map(shellQuoted)
+            .joined(separator: " ")
+    }
+
     nonisolated static func search(
         folder: URL,
         filePatterns: FilePatternFilter,
@@ -434,29 +479,7 @@ enum SearchEngine {
     ) async {
         let process = Process()
         let outputPipe = Pipe()
-
-        var arguments = [
-            "-R",
-            "-n",
-            "-H",
-            "-I",
-            "-F",
-            "-s",
-            "--line-buffered",
-            "--exclude-dir=.git",
-            "--exclude-dir=.build",
-            "--exclude-dir=DerivedData"
-        ]
-
-        if !filePatterns.allowsAllFiles {
-            arguments.append(contentsOf: filePatterns.includePatterns.map { "--include=\($0)" })
-        }
-
-        arguments.append(contentsOf: filePatterns.grepExcludePatterns.map { "--exclude=\($0)" })
-        arguments.append(contentsOf: filePatterns.grepExcludeDirPatterns.map { "--exclude-dir=\($0)" })
-
-        arguments.append(text)
-        arguments.append(folder.path)
+        let arguments = grepArguments(folder: folder.path, filePatterns: filePatterns, text: text)
 
         process.executableURL = URL(fileURLWithPath: "/usr/bin/grep")
         process.arguments = arguments
@@ -508,6 +531,7 @@ enum SearchEngine {
         onResult: @escaping @Sendable (GrepResult) async -> Void
     ) async {
         guard let result = parse(line: line, folderPath: folderPath),
+              filePatterns.includes(relativePath: result.filePath),
               !filePatterns.excludes(relativePath: result.filePath) else {
             return
         }
@@ -547,6 +571,40 @@ enum SearchEngine {
 
         return path
     }
+
+    private nonisolated static func grepArguments(folder: String, filePatterns: FilePatternFilter, text: String) -> [String] {
+        var arguments = [
+            "-R",
+            "-n",
+            "-H",
+            "-I",
+            "-F",
+            "-s",
+            "--line-buffered",
+            "--exclude-dir=.git",
+            "--exclude-dir=.build",
+            "--exclude-dir=DerivedData"
+        ]
+
+        if !filePatterns.allowsAllFiles {
+            arguments.append(contentsOf: filePatterns.grepIncludePatterns.map { "--include=\($0)" })
+        }
+
+        arguments.append(contentsOf: filePatterns.grepExcludePatterns.map { "--exclude=\($0)" })
+        arguments.append(contentsOf: filePatterns.grepExcludeDirPatterns.map { "--exclude-dir=\($0)" })
+        arguments.append(text)
+        arguments.append(folder)
+
+        return arguments
+    }
+
+    private nonisolated static func shellQuoted(_ value: String) -> String {
+        if value.rangeOfCharacter(from: CharacterSet(charactersIn: " \t\n'\"\\$&;()<>|*?[]{}!")) == nil {
+            return value
+        }
+
+        return "'\(value.replacingOccurrences(of: "'", with: "'\\''"))'"
+    }
 }
 
 private final class GrepProcessBox: @unchecked Sendable {
@@ -582,6 +640,10 @@ struct ResultsTable: View {
     let results: [GrepResult]
     let folder: String
     let folderBookmark: Data
+    @Binding var fileFilter: String
+    @Binding var fileExclusions: String
+    let searchText: String
+    let onRun: () -> Void
     @State private var selection = Set<GrepResult.ID>()
 
     var body: some View {
@@ -603,6 +665,76 @@ struct ResultsTable: View {
     private func resultCell(_ text: String, result: GrepResult) -> some View {
         Text(text)
             .contentShape(Rectangle())
+            .contextMenu {
+                Button {
+                    selection = [result.id]
+                    EmacsOpener.open(result, folder: folder, folderBookmark: folderBookmark)
+                } label: {
+                    Label("Open in Emacs", systemImage: "arrow.up.forward.app")
+                }
+
+                Button {
+                    selection = [result.id]
+                    openEnclosingFolder(for: result)
+                } label: {
+                    Label("Open in Enclosing Folder", systemImage: "folder")
+                }
+
+                Divider()
+
+                Button {
+                    selection = [result.id]
+                    copy(result.absoluteFilePath)
+                } label: {
+                    Label("Copy File Path", systemImage: "doc.on.doc")
+                }
+
+                Button {
+                    selection = [result.id]
+                    copy(result.text)
+                } label: {
+                    Label("Copy Match", systemImage: "text.quote")
+                }
+
+                Divider()
+
+                Button {
+                    selection = [result.id]
+                    openTerminalHere(for: result)
+                } label: {
+                    Label("Open in Terminal Here", systemImage: "terminal")
+                }
+
+                Button {
+                    selection = [result.id]
+                    searchThisFileOnly(result)
+                } label: {
+                    Label("Search This File Only", systemImage: "doc.text.magnifyingglass")
+                }
+
+                Button {
+                    selection = [result.id]
+                    copyGrepCommand()
+                } label: {
+                    Label("Copy Grep Command", systemImage: "curlybraces")
+                }
+
+                Divider()
+
+                Button {
+                    selection = [result.id]
+                    excludeThisFile(result)
+                } label: {
+                    Label("Exclude This File", systemImage: "doc.badge.minus")
+                }
+
+                Button {
+                    selection = [result.id]
+                    excludeThisFolder(result)
+                } label: {
+                    Label("Exclude This Folder", systemImage: "folder.badge.minus")
+                }
+            }
             .simultaneousGesture(
                 TapGesture()
                     .onEnded {
@@ -616,5 +748,69 @@ struct ResultsTable: View {
                         EmacsOpener.open(result, folder: folder, folderBookmark: folderBookmark)
                     }
             )
+    }
+
+    private func openEnclosingFolder(for result: GrepResult) {
+        let fileURL = URL(fileURLWithPath: result.absoluteFilePath)
+        NSWorkspace.shared.activateFileViewerSelecting([fileURL])
+    }
+
+    private func copy(_ value: String) {
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(value, forType: .string)
+    }
+
+    private func openTerminalHere(for result: GrepResult) {
+        let folderURL = URL(fileURLWithPath: result.absoluteFilePath).deletingLastPathComponent()
+        let process = Process()
+
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/open")
+        process.arguments = ["-a", "Terminal", folderURL.path]
+
+        try? process.run()
+    }
+
+    private func searchThisFileOnly(_ result: GrepResult) {
+        fileFilter = result.filePath
+        onRun()
+    }
+
+    private func copyGrepCommand() {
+        let filePatterns = FilePatternFilter.parse(includes: fileFilter, excludes: fileExclusions)
+        copy(SearchEngine.grepCommand(folder: folder, filePatterns: filePatterns, text: searchText))
+    }
+
+    private func excludeThisFile(_ result: GrepResult) {
+        appendExclusion(result.filePath)
+    }
+
+    private func excludeThisFolder(_ result: GrepResult) {
+        let components = result.filePath.split(separator: "/").map(String.init)
+
+        guard components.count > 1 else {
+            return
+        }
+
+        appendExclusion("\(components.dropLast().joined(separator: "/"))/")
+    }
+
+    private func appendExclusion(_ value: String) {
+        let existingValues = Set(
+            fileExclusions
+                .split { character in
+                    character == "," || character == ";" || character.isWhitespace
+                }
+                .map(String.init)
+        )
+
+        guard !existingValues.contains(value) else {
+            return
+        }
+
+        if fileExclusions.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            fileExclusions = value
+        } else {
+            fileExclusions += ", \(value)"
+        }
     }
 }
