@@ -21,6 +21,7 @@ struct ContentView: View {
     @AppStorage("fileFilter") private var fileFilter = ""
     @AppStorage("fileExclusions") private var fileExclusions = ""
     @AppStorage("searchSubfolders") private var searchSubfolders = true
+    @AppStorage("caseSensitiveSearch") private var caseSensitiveSearch = true
     @AppStorage("searchFolderBookmark") private var folderBookmark = Data()
     @State private var searchText = ""
     @State private var results: [GrepResult] = []
@@ -41,6 +42,7 @@ struct ContentView: View {
                 fileExclusions: $fileExclusions,
                 searchSubfolders: $searchSubfolders,
                 searchText: $searchText,
+                caseSensitiveSearch: $caseSensitiveSearch,
                 isSearching: isSearching,
                 onMoveUp: moveFolderUp,
                 onBrowse: chooseFolder,
@@ -64,6 +66,7 @@ struct ContentView: View {
                 fileExclusions: $fileExclusions,
                 searchText: searchText,
                 searchSubfolders: searchSubfolders,
+                caseSensitiveSearch: caseSensitiveSearch,
                 onRun: runSearch
             )
         }
@@ -108,6 +111,7 @@ struct ContentView: View {
         let filePatterns = FilePatternFilter.parse(includes: fileFilter, excludes: fileExclusions)
         let needle = searchText
         let recursive = searchSubfolders
+        let caseSensitive = caseSensitiveSearch
 
         isSearching = true
         searchTask = Task {
@@ -124,7 +128,8 @@ struct ContentView: View {
                     folder: folderAccess.url,
                     filePatterns: filePatterns,
                     text: needle,
-                    recursive: recursive
+                    recursive: recursive,
+                    caseSensitive: caseSensitive
                 ) { result in
                     await MainActor.run {
                         guard currentSearchID == searchID else { return }
@@ -227,6 +232,7 @@ struct SearchBar: View {
     @Binding var fileExclusions: String
     @Binding var searchSubfolders: Bool
     @Binding var searchText: String
+    @Binding var caseSensitiveSearch: Bool
 
     @State private var isFileOptionsExpanded = false
 
@@ -316,6 +322,9 @@ struct SearchBar: View {
                         .frame(width: 76)
                 }
                 .disabled(!isSearching)
+
+                Toggle("Case Sensitive", isOn: $caseSensitiveSearch)
+                    .toggleStyle(.checkbox)
             }
         }
         .padding(12)
@@ -536,13 +545,14 @@ struct FilePatternFilter: Sendable {
 }
 
 enum SearchEngine {
-    nonisolated static func grepCommand(folder: String, filePatterns: FilePatternFilter, text: String, recursive: Bool) -> String {
+    nonisolated static func grepCommand(folder: String, filePatterns: FilePatternFilter, text: String, recursive: Bool, caseSensitive: Bool) -> String {
         let folderURL = URL(fileURLWithPath: folder)
         let arguments = grepArguments(
             folder: folderURL,
             filePatterns: filePatterns,
             text: text,
-            recursive: recursive
+            recursive: recursive,
+            caseSensitive: caseSensitive
         )
 
         guard !arguments.isEmpty else {
@@ -614,6 +624,7 @@ enum SearchEngine {
         filePatterns: FilePatternFilter,
         text: String,
         recursive: Bool,
+        caseSensitive: Bool,
         onResult: @escaping @Sendable (GrepResult) async -> Void
     ) async {
         let processBox = GrepProcessBox()
@@ -624,6 +635,7 @@ enum SearchEngine {
                 filePatterns: filePatterns,
                 text: text,
                 recursive: recursive,
+                caseSensitive: caseSensitive,
                 processBox: processBox,
                 onResult: onResult
             )
@@ -637,12 +649,13 @@ enum SearchEngine {
         filePatterns: FilePatternFilter,
         text: String,
         recursive: Bool,
+        caseSensitive: Bool,
         processBox: GrepProcessBox,
         onResult: @escaping @Sendable (GrepResult) async -> Void
     ) async {
         let process = Process()
         let outputPipe = Pipe()
-        let arguments = grepArguments(folder: folder, filePatterns: filePatterns, text: text, recursive: recursive)
+        let arguments = grepArguments(folder: folder, filePatterns: filePatterns, text: text, recursive: recursive, caseSensitive: caseSensitive)
 
         guard !arguments.isEmpty else {
             return
@@ -739,7 +752,7 @@ enum SearchEngine {
         return path
     }
 
-    private nonisolated static func grepArguments(folder: URL, filePatterns: FilePatternFilter, text: String, recursive: Bool) -> [String] {
+    private nonisolated static func grepArguments(folder: URL, filePatterns: FilePatternFilter, text: String, recursive: Bool, caseSensitive: Bool) -> [String] {
         var arguments = [
             "-n",
             "-H",
@@ -751,6 +764,10 @@ enum SearchEngine {
             "--exclude-dir=.build",
             "--exclude-dir=DerivedData"
         ]
+
+        if !caseSensitive {
+            arguments.append("-i")
+        }
 
         if recursive {
             arguments.insert("-R", at: 0)
@@ -828,6 +845,7 @@ struct ResultsTable: View {
     @Binding var fileExclusions: String
     let searchText: String
     let searchSubfolders: Bool
+    let caseSensitiveSearch: Bool
     let onRun: () -> Void
     @State private var selection = Set<GrepResult.ID>()
 
@@ -966,7 +984,8 @@ struct ResultsTable: View {
                 folder: folder,
                 filePatterns: filePatterns,
                 text: searchText,
-                recursive: searchSubfolders
+                recursive: searchSubfolders,
+                caseSensitive: caseSensitiveSearch
             )
         )
     }
