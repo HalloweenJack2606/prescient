@@ -20,12 +20,18 @@ struct ContentView: View {
     @AppStorage("searchFolder") private var folder = ""
     @AppStorage("fileFilter") private var fileFilter = ""
     @AppStorage("fileExclusions") private var fileExclusions = ""
+    @AppStorage("searchSubfolders") private var searchSubfolders = true
     @AppStorage("searchFolderBookmark") private var folderBookmark = Data()
     @State private var searchText = ""
     @State private var results: [GrepResult] = []
+    @State private var searchedFileCount = 0
     @State private var isSearching = false
     @State private var searchTask: Task<Void, Never>?
     @State private var currentSearchID: UUID?
+
+    private var matchingFileCount: Int {
+        Set(results.map(\.filePath)).count
+    }
 
     var body: some View {
         VStack(spacing: 12) {
@@ -33,12 +39,22 @@ struct ContentView: View {
                 folder: $folder,
                 fileFilter: $fileFilter,
                 fileExclusions: $fileExclusions,
+                searchSubfolders: $searchSubfolders,
                 searchText: $searchText,
                 isSearching: isSearching,
+                onMoveUp: moveFolderUp,
                 onBrowse: chooseFolder,
                 onRun: runSearch,
                 onStop: stopSearch
             )
+
+            HStack {
+                Text("Found \(results.count) matching lines in \(matchingFileCount) files (of \(searchedFileCount) searched)")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+
+                Spacer()
+            }
 
             ResultsTable(
                 results: results,
@@ -47,6 +63,7 @@ struct ContentView: View {
                 fileFilter: $fileFilter,
                 fileExclusions: $fileExclusions,
                 searchText: searchText,
+                searchSubfolders: searchSubfolders,
                 onRun: runSearch
             )
         }
@@ -74,6 +91,7 @@ struct ContentView: View {
         let searchID = UUID()
         currentSearchID = searchID
         results = []
+        searchedFileCount = 0
 
         guard !folder.isEmpty, !searchText.isEmpty else {
             isSearching = false
@@ -89,11 +107,25 @@ struct ContentView: View {
 
         let filePatterns = FilePatternFilter.parse(includes: fileFilter, excludes: fileExclusions)
         let needle = searchText
+        let recursive = searchSubfolders
 
         isSearching = true
         searchTask = Task {
+            let countWorker = Task.detached(priority: .utility) {
+                SearchEngine.countSearchableFiles(
+                    folder: folderAccess.url,
+                    filePatterns: filePatterns,
+                    recursive: recursive
+                )
+            }
+
             let worker = Task.detached(priority: .userInitiated) {
-                await SearchEngine.search(folder: folderAccess.url, filePatterns: filePatterns, text: needle) { result in
+                await SearchEngine.search(
+                    folder: folderAccess.url,
+                    filePatterns: filePatterns,
+                    text: needle,
+                    recursive: recursive
+                ) { result in
                     await MainActor.run {
                         guard currentSearchID == searchID else { return }
                         results.append(result)
@@ -103,8 +135,15 @@ struct ContentView: View {
 
             await withTaskCancellationHandler {
                 await worker.value
+                let count = await countWorker.value
+
+                await MainActor.run {
+                    guard currentSearchID == searchID else { return }
+                    searchedFileCount = count
+                }
             } onCancel: {
                 worker.cancel()
+                countWorker.cancel()
             }
 
             folderAccess.stopAccessing()
@@ -113,6 +152,22 @@ struct ContentView: View {
             isSearching = false
             currentSearchID = nil
         }
+    }
+
+    private func moveFolderUp() {
+        guard !folder.isEmpty else {
+            return
+        }
+
+        let currentURL = URL(fileURLWithPath: folder).standardizedFileURL
+        let parentURL = currentURL.deletingLastPathComponent()
+
+        guard parentURL.path != currentURL.path else {
+            return
+        }
+
+        folder = parentURL.path
+        saveBookmark(for: parentURL)
     }
 
     private func stopSearch() {
@@ -170,11 +225,13 @@ struct SearchBar: View {
     @Binding var folder: String
     @Binding var fileFilter: String
     @Binding var fileExclusions: String
+    @Binding var searchSubfolders: Bool
     @Binding var searchText: String
 
     @State private var isFileOptionsExpanded = false
 
     let isSearching: Bool
+    let onMoveUp: () -> Void
     let onBrowse: () -> Void
     let onRun: () -> Void
     let onStop: () -> Void
@@ -187,13 +244,28 @@ struct SearchBar: View {
                         TextField("/path/to/folder", text: $folder)
                             .textFieldStyle(.plain)
 
+                        Button(action: onMoveUp) {
+                            ZStack(alignment: .topTrailing) {
+                                Image(systemName: "folder")
+                                Image(systemName: "arrow.up.circle.fill")
+                                    .font(.system(size: 9))
+                                    .offset(x: 3, y: -3)
+                            }
+                            .frame(width: 24, height: 24)
+                        }
+                        .buttonStyle(.borderless)
+                        .help("Move up one folder")
+
                         Button(action: onBrowse) {
                             Image(systemName: "folder")
                         }
                         .buttonStyle(.borderless)
-                            .help("Choose folder")
+                        .help("Choose folder")
                     }
                 }
+
+                Toggle("Search Subfolders", isOn: $searchSubfolders)
+                    .toggleStyle(.checkbox)
             }
 
             VStack(spacing: 8) {
@@ -334,6 +406,28 @@ struct FilePatternFilter: Sendable {
         }
     }
 
+    nonisolated func excludesDirectory(relativePath: String) -> Bool {
+        let normalizedPath = relativePath.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+
+        guard !normalizedPath.isEmpty else {
+            return false
+        }
+
+        let components = normalizedPath.split(separator: "/").map(String.init)
+
+        return excludeDirPatterns.contains { pattern in
+            if pattern.contains("/") {
+                return pathMatches(pattern: pattern, value: normalizedPath)
+                    || pathMatches(pattern: pattern, value: "\(normalizedPath)/")
+                    || pathMatches(pattern: pattern, value: "\(normalizedPath)/_")
+            }
+
+            return components.contains { component in
+                pathMatches(pattern: pattern, value: component)
+            }
+        }
+    }
+
     nonisolated static func parse(includes: String, excludes: String) -> FilePatternFilter {
         let excludeTokens = tokens(from: excludes)
         let includePatterns = tokens(from: includes).map(normalizeInclude)
@@ -442,17 +536,84 @@ struct FilePatternFilter: Sendable {
 }
 
 enum SearchEngine {
-    nonisolated static func grepCommand(folder: String, filePatterns: FilePatternFilter, text: String) -> String {
-        let arguments = grepArguments(folder: folder, filePatterns: filePatterns, text: text)
+    nonisolated static func grepCommand(folder: String, filePatterns: FilePatternFilter, text: String, recursive: Bool) -> String {
+        let folderURL = URL(fileURLWithPath: folder)
+        let arguments = grepArguments(
+            folder: folderURL,
+            filePatterns: filePatterns,
+            text: text,
+            recursive: recursive
+        )
+
+        guard !arguments.isEmpty else {
+            return ""
+        }
+
         return ([URL(fileURLWithPath: "/usr/bin/grep").path] + arguments)
             .map(shellQuoted)
             .joined(separator: " ")
+    }
+
+    nonisolated static func countSearchableFiles(folder: URL, filePatterns: FilePatternFilter, recursive: Bool) -> Int {
+        searchableFiles(folder: folder, filePatterns: filePatterns, recursive: recursive).count
+    }
+
+    private nonisolated static func searchableFiles(folder: URL, filePatterns: FilePatternFilter, recursive: Bool) -> [URL] {
+        let folderPath = folder.standardizedFileURL.path
+        let keys: [URLResourceKey] = [.isDirectoryKey, .isRegularFileKey]
+
+        guard let enumerator = FileManager.default.enumerator(
+            at: folder,
+            includingPropertiesForKeys: keys,
+            options: [],
+            errorHandler: { _, _ in true }
+        ) else {
+            return []
+        }
+
+        var files: [URL] = []
+
+        for case let fileURL as URL in enumerator {
+            if Task.isCancelled {
+                break
+            }
+
+            let relativePath = relativePath(from: fileURL.standardizedFileURL.path, folderPath: folderPath)
+
+            guard let resourceValues = try? fileURL.resourceValues(forKeys: Set(keys)) else {
+                continue
+            }
+
+            if resourceValues.isDirectory == true {
+                if !recursive {
+                    enumerator.skipDescendants()
+                    continue
+                }
+
+                if filePatterns.excludesDirectory(relativePath: relativePath) {
+                    enumerator.skipDescendants()
+                }
+
+                continue
+            }
+
+            guard resourceValues.isRegularFile == true,
+                  filePatterns.includes(relativePath: relativePath),
+                  !filePatterns.excludes(relativePath: relativePath) else {
+                continue
+            }
+
+            files.append(fileURL)
+        }
+
+        return files
     }
 
     nonisolated static func search(
         folder: URL,
         filePatterns: FilePatternFilter,
         text: String,
+        recursive: Bool,
         onResult: @escaping @Sendable (GrepResult) async -> Void
     ) async {
         let processBox = GrepProcessBox()
@@ -462,6 +623,7 @@ enum SearchEngine {
                 folder: folder,
                 filePatterns: filePatterns,
                 text: text,
+                recursive: recursive,
                 processBox: processBox,
                 onResult: onResult
             )
@@ -474,12 +636,17 @@ enum SearchEngine {
         folder: URL,
         filePatterns: FilePatternFilter,
         text: String,
+        recursive: Bool,
         processBox: GrepProcessBox,
         onResult: @escaping @Sendable (GrepResult) async -> Void
     ) async {
         let process = Process()
         let outputPipe = Pipe()
-        let arguments = grepArguments(folder: folder.path, filePatterns: filePatterns, text: text)
+        let arguments = grepArguments(folder: folder, filePatterns: filePatterns, text: text, recursive: recursive)
+
+        guard !arguments.isEmpty else {
+            return
+        }
 
         process.executableURL = URL(fileURLWithPath: "/usr/bin/grep")
         process.arguments = arguments
@@ -572,9 +739,8 @@ enum SearchEngine {
         return path
     }
 
-    private nonisolated static func grepArguments(folder: String, filePatterns: FilePatternFilter, text: String) -> [String] {
+    private nonisolated static func grepArguments(folder: URL, filePatterns: FilePatternFilter, text: String, recursive: Bool) -> [String] {
         var arguments = [
-            "-R",
             "-n",
             "-H",
             "-I",
@@ -586,14 +752,32 @@ enum SearchEngine {
             "--exclude-dir=DerivedData"
         ]
 
-        if !filePatterns.allowsAllFiles {
+        if recursive {
+            arguments.insert("-R", at: 0)
+        }
+
+        if recursive, !filePatterns.allowsAllFiles {
             arguments.append(contentsOf: filePatterns.grepIncludePatterns.map { "--include=\($0)" })
         }
 
-        arguments.append(contentsOf: filePatterns.grepExcludePatterns.map { "--exclude=\($0)" })
-        arguments.append(contentsOf: filePatterns.grepExcludeDirPatterns.map { "--exclude-dir=\($0)" })
+        if recursive {
+            arguments.append(contentsOf: filePatterns.grepExcludePatterns.map { "--exclude=\($0)" })
+            arguments.append(contentsOf: filePatterns.grepExcludeDirPatterns.map { "--exclude-dir=\($0)" })
+        }
+
         arguments.append(text)
-        arguments.append(folder)
+
+        if recursive {
+            arguments.append(folder.path)
+        } else {
+            let files = searchableFiles(folder: folder, filePatterns: filePatterns, recursive: false)
+
+            guard !files.isEmpty else {
+                return []
+            }
+
+            arguments.append(contentsOf: files.map(\.path))
+        }
 
         return arguments
     }
@@ -643,6 +827,7 @@ struct ResultsTable: View {
     @Binding var fileFilter: String
     @Binding var fileExclusions: String
     let searchText: String
+    let searchSubfolders: Bool
     let onRun: () -> Void
     @State private var selection = Set<GrepResult.ID>()
 
@@ -651,11 +836,10 @@ struct ResultsTable: View {
             TableColumn("File") { result in
                 resultCell(result.filePath, result: result)
             }
-                .width(min: 180, ideal: 240, max: 320)
             TableColumn("Line") { result in
                 resultCell("\(result.line)", result: result)
             }
-            .width(48)
+            .width(min: 56, ideal: 56, max: 56)
             TableColumn("Text") { result in
                 resultCell(result.text, result: result)
             }
@@ -777,7 +961,14 @@ struct ResultsTable: View {
 
     private func copyGrepCommand() {
         let filePatterns = FilePatternFilter.parse(includes: fileFilter, excludes: fileExclusions)
-        copy(SearchEngine.grepCommand(folder: folder, filePatterns: filePatterns, text: searchText))
+        copy(
+            SearchEngine.grepCommand(
+                folder: folder,
+                filePatterns: filePatterns,
+                text: searchText,
+                recursive: searchSubfolders
+            )
+        )
     }
 
     private func excludeThisFile(_ result: GrepResult) {
