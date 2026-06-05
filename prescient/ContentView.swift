@@ -16,6 +16,11 @@ struct SearchFolderAccess: Sendable {
     let stopAccessing: @Sendable () -> Void
 }
 
+struct SearchTextField: Identifiable, Sendable {
+    let id = UUID()
+    var text = ""
+}
+
 struct ContentView: View {
     @AppStorage("searchFolder") private var folder = ""
     @AppStorage("fileFilter") private var fileFilter = ""
@@ -24,6 +29,7 @@ struct ContentView: View {
     @AppStorage("caseSensitiveSearch") private var caseSensitiveSearch = true
     @AppStorage("searchFolderBookmark") private var folderBookmark = Data()
     @State private var searchText = ""
+    @State private var additionalSearchTexts: [SearchTextField] = []
     @State private var results: [GrepResult] = []
     @State private var searchedFileCount = 0
     @State private var isSearching = false
@@ -34,6 +40,12 @@ struct ContentView: View {
         Set(results.map(\.filePath)).count
     }
 
+    private var activeSearchTexts: [String] {
+        ([searchText] + additionalSearchTexts.map(\.text))
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+    }
+
     var body: some View {
         VStack(spacing: 12) {
             SearchBar(
@@ -42,6 +54,7 @@ struct ContentView: View {
                 fileExclusions: $fileExclusions,
                 searchSubfolders: $searchSubfolders,
                 searchText: $searchText,
+                additionalSearchTexts: $additionalSearchTexts,
                 caseSensitiveSearch: $caseSensitiveSearch,
                 isSearching: isSearching,
                 onMoveUp: moveFolderUp,
@@ -64,7 +77,7 @@ struct ContentView: View {
                 folderBookmark: folderBookmark,
                 fileFilter: $fileFilter,
                 fileExclusions: $fileExclusions,
-                searchText: searchText,
+                searchTexts: activeSearchTexts,
                 searchSubfolders: searchSubfolders,
                 caseSensitiveSearch: caseSensitiveSearch,
                 onRun: runSearch
@@ -96,7 +109,9 @@ struct ContentView: View {
         results = []
         searchedFileCount = 0
 
-        guard !folder.isEmpty, !searchText.isEmpty else {
+        let needles = activeSearchTexts
+
+        guard !folder.isEmpty, !needles.isEmpty else {
             isSearching = false
             currentSearchID = nil
             return
@@ -109,7 +124,6 @@ struct ContentView: View {
         }
 
         let filePatterns = FilePatternFilter.parse(includes: fileFilter, excludes: fileExclusions)
-        let needle = searchText
         let recursive = searchSubfolders
         let caseSensitive = caseSensitiveSearch
 
@@ -127,7 +141,7 @@ struct ContentView: View {
                 await SearchEngine.search(
                     folder: folderAccess.url,
                     filePatterns: filePatterns,
-                    text: needle,
+                    texts: needles,
                     recursive: recursive,
                     caseSensitive: caseSensitive
                 ) { result in
@@ -232,6 +246,7 @@ struct SearchBar: View {
     @Binding var fileExclusions: String
     @Binding var searchSubfolders: Bool
     @Binding var searchText: String
+    @Binding var additionalSearchTexts: [SearchTextField]
     @Binding var caseSensitiveSearch: Bool
 
     @State private var isFileOptionsExpanded = false
@@ -303,32 +318,66 @@ struct SearchBar: View {
                 }
             }
 
-            HStack(spacing: 10) {
-                LabeledField(title: "Text") {
-                    TextField("Text to find", text: $searchText)
-                        .textFieldStyle(.plain)
-                        .onSubmit(onRun)
+            VStack(spacing: 8) {
+                HStack(spacing: 10) {
+                    LabeledField(title: "Text") {
+                        TextField("Text to find", text: $searchText)
+                            .textFieldStyle(.plain)
+                            .onSubmit(onRun)
+                    }
+
+                    Button(action: addSearchTextField) {
+                        Label("Add", systemImage: "plus")
+                            .frame(width: 72)
+                    }
+
+                    Button(action: onRun) {
+                        Label(isSearching ? "Searching" : "Search", systemImage: "magnifyingglass")
+                            .frame(width: 100)
+                    }
+                    .keyboardShortcut(.return, modifiers: .command)
+                    .disabled(isSearching)
+
+                    Button(action: onStop) {
+                        Label("Stop", systemImage: "stop.fill")
+                            .frame(width: 76)
+                    }
+                    .disabled(!isSearching)
+
+                    Toggle("Case Sensitive", isOn: $caseSensitiveSearch)
+                        .toggleStyle(.checkbox)
                 }
 
-                Button(action: onRun) {
-                    Label(isSearching ? "Searching" : "Search", systemImage: "magnifyingglass")
-                        .frame(width: 100)
-                }
-                .keyboardShortcut(.return, modifiers: .command)
-                .disabled(isSearching)
+                ForEach($additionalSearchTexts) { $searchTerm in
+                    LabeledField(title: "") {
+                        HStack(spacing: 6) {
+                            TextField("Text to find", text: $searchTerm.text)
+                                .textFieldStyle(.plain)
+                                .onSubmit(onRun)
 
-                Button(action: onStop) {
-                    Label("Stop", systemImage: "stop.fill")
-                        .frame(width: 76)
+                            Button {
+                                removeSearchTextField(searchTerm.id)
+                            } label: {
+                                Image(systemName: "xmark")
+                                    .frame(width: 24, height: 24)
+                            }
+                            .buttonStyle(.borderless)
+                            .help("Remove search text")
+                        }
+                    }
                 }
-                .disabled(!isSearching)
-
-                Toggle("Case Sensitive", isOn: $caseSensitiveSearch)
-                    .toggleStyle(.checkbox)
             }
         }
         .padding(12)
         .glassEffect(.regular, in: .rect(cornerRadius: 12))
+    }
+
+    private func addSearchTextField() {
+        additionalSearchTexts.append(SearchTextField())
+    }
+
+    private func removeSearchTextField(_ id: SearchTextField.ID) {
+        additionalSearchTexts.removeAll { $0.id == id }
     }
 }
 
@@ -545,12 +594,12 @@ struct FilePatternFilter: Sendable {
 }
 
 enum SearchEngine {
-    nonisolated static func grepCommand(folder: String, filePatterns: FilePatternFilter, text: String, recursive: Bool, caseSensitive: Bool) -> String {
+    nonisolated static func grepCommand(folder: String, filePatterns: FilePatternFilter, texts: [String], recursive: Bool, caseSensitive: Bool) -> String {
         let folderURL = URL(fileURLWithPath: folder)
         let arguments = grepArguments(
             folder: folderURL,
             filePatterns: filePatterns,
-            text: text,
+            texts: texts,
             recursive: recursive,
             caseSensitive: caseSensitive
         )
@@ -622,7 +671,7 @@ enum SearchEngine {
     nonisolated static func search(
         folder: URL,
         filePatterns: FilePatternFilter,
-        text: String,
+        texts: [String],
         recursive: Bool,
         caseSensitive: Bool,
         onResult: @escaping @Sendable (GrepResult) async -> Void
@@ -633,7 +682,7 @@ enum SearchEngine {
             await runGrep(
                 folder: folder,
                 filePatterns: filePatterns,
-                text: text,
+                texts: texts,
                 recursive: recursive,
                 caseSensitive: caseSensitive,
                 processBox: processBox,
@@ -647,7 +696,7 @@ enum SearchEngine {
     private nonisolated static func runGrep(
         folder: URL,
         filePatterns: FilePatternFilter,
-        text: String,
+        texts: [String],
         recursive: Bool,
         caseSensitive: Bool,
         processBox: GrepProcessBox,
@@ -655,7 +704,7 @@ enum SearchEngine {
     ) async {
         let process = Process()
         let outputPipe = Pipe()
-        let arguments = grepArguments(folder: folder, filePatterns: filePatterns, text: text, recursive: recursive, caseSensitive: caseSensitive)
+        let arguments = grepArguments(folder: folder, filePatterns: filePatterns, texts: texts, recursive: recursive, caseSensitive: caseSensitive)
 
         guard !arguments.isEmpty else {
             return
@@ -752,7 +801,15 @@ enum SearchEngine {
         return path
     }
 
-    private nonisolated static func grepArguments(folder: URL, filePatterns: FilePatternFilter, text: String, recursive: Bool, caseSensitive: Bool) -> [String] {
+    private nonisolated static func grepArguments(folder: URL, filePatterns: FilePatternFilter, texts: [String], recursive: Bool, caseSensitive: Bool) -> [String] {
+        let activeTexts = texts
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+
+        guard !activeTexts.isEmpty else {
+            return []
+        }
+
         var arguments = [
             "-n",
             "-H",
@@ -782,7 +839,10 @@ enum SearchEngine {
             arguments.append(contentsOf: filePatterns.grepExcludeDirPatterns.map { "--exclude-dir=\($0)" })
         }
 
-        arguments.append(text)
+        for text in activeTexts {
+            arguments.append("-e")
+            arguments.append(text)
+        }
 
         if recursive {
             arguments.append(folder.path)
@@ -843,7 +903,7 @@ struct ResultsTable: View {
     let folderBookmark: Data
     @Binding var fileFilter: String
     @Binding var fileExclusions: String
-    let searchText: String
+    let searchTexts: [String]
     let searchSubfolders: Bool
     let caseSensitiveSearch: Bool
     let onRun: () -> Void
@@ -983,7 +1043,7 @@ struct ResultsTable: View {
             SearchEngine.grepCommand(
                 folder: folder,
                 filePatterns: filePatterns,
-                text: searchText,
+                texts: searchTexts,
                 recursive: searchSubfolders,
                 caseSensitive: caseSensitiveSearch
             )
