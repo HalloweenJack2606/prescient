@@ -104,7 +104,7 @@ enum EmacsOpener {
             arguments: [
                 "-n",
                 "--eval",
-                openInCurrentWindowExpression(filePath: result.absoluteFilePath, line: result.line)
+                openInCurrentWindowExpression(filePath: result.absoluteFilePath, line: result.line ?? 1)
             ]
         )
 
@@ -138,7 +138,7 @@ enum EmacsOpener {
             arguments: [
                 "--eval",
                 startServerExpression,
-                "+\(result.line)",
+                "+\(result.line ?? 1)",
                 result.absoluteFilePath
             ]
         )
