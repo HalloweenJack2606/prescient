@@ -31,13 +31,28 @@ struct ContentView: View {
     @State private var searchText = ""
     @State private var additionalSearchTexts: [SearchTextField] = []
     @State private var results: [GrepResult] = []
-    @State private var searchedFileCount = 0
+    @State private var searchedFileCount: Int?
+    @State private var isCountingSearchedFiles = false
     @State private var isSearching = false
     @State private var searchTask: Task<Void, Never>?
     @State private var currentSearchID: UUID?
 
     private var matchingFileCount: Int {
         Set(results.map(\.filePath)).count
+    }
+
+    private var searchSummary: String {
+        let countStatus: String
+
+        if isCountingSearchedFiles {
+            countStatus = "searched files calculating..."
+        } else if let searchedFileCount {
+            countStatus = "of \(searchedFileCount) searched"
+        } else {
+            countStatus = "searched files not calculated"
+        }
+
+        return "Found \(results.count) matching lines in \(matchingFileCount) files (\(countStatus))"
     }
 
     private var activeSearchTexts: [String] {
@@ -57,6 +72,7 @@ struct ContentView: View {
                 additionalSearchTexts: $additionalSearchTexts,
                 caseSensitiveSearch: $caseSensitiveSearch,
                 isSearching: isSearching,
+                canStop: isSearching || isCountingSearchedFiles,
                 onMoveUp: moveFolderUp,
                 onBrowse: chooseFolder,
                 onRun: runSearch,
@@ -64,7 +80,7 @@ struct ContentView: View {
             )
 
             HStack {
-                Text("Found \(results.count) matching lines in \(matchingFileCount) files (of \(searchedFileCount) searched)")
+                Text(searchSummary)
                     .font(.caption)
                     .foregroundStyle(.secondary)
 
@@ -107,7 +123,8 @@ struct ContentView: View {
         let searchID = UUID()
         currentSearchID = searchID
         results = []
-        searchedFileCount = 0
+        searchedFileCount = nil
+        isCountingSearchedFiles = false
 
         let needles = activeSearchTexts
 
@@ -129,12 +146,8 @@ struct ContentView: View {
 
         isSearching = true
         searchTask = Task {
-            let countWorker = Task.detached(priority: .utility) {
-                SearchEngine.countSearchableFiles(
-                    folder: folderAccess.url,
-                    filePatterns: filePatterns,
-                    recursive: recursive
-                )
+            defer {
+                folderAccess.stopAccessing()
             }
 
             let worker = Task.detached(priority: .userInitiated) {
@@ -154,22 +167,39 @@ struct ContentView: View {
 
             await withTaskCancellationHandler {
                 await worker.value
+
+                await MainActor.run {
+                    guard currentSearchID == searchID else { return }
+                    isSearching = false
+                    isCountingSearchedFiles = true
+                }
+            } onCancel: {
+                worker.cancel()
+            }
+
+            guard !Task.isCancelled, currentSearchID == searchID else { return }
+
+            let countWorker = Task.detached(priority: .utility) {
+                SearchEngine.countSearchableFiles(
+                    folder: folderAccess.url,
+                    filePatterns: filePatterns,
+                    recursive: recursive
+                )
+            }
+
+            await withTaskCancellationHandler {
                 let count = await countWorker.value
 
                 await MainActor.run {
                     guard currentSearchID == searchID else { return }
                     searchedFileCount = count
+                    isCountingSearchedFiles = false
+                    currentSearchID = nil
+                    searchTask = nil
                 }
             } onCancel: {
-                worker.cancel()
                 countWorker.cancel()
             }
-
-            folderAccess.stopAccessing()
-
-            guard currentSearchID == searchID else { return }
-            isSearching = false
-            currentSearchID = nil
         }
     }
 
@@ -193,6 +223,8 @@ struct ContentView: View {
         searchTask?.cancel()
         searchTask = nil
         isSearching = false
+        isCountingSearchedFiles = false
+        currentSearchID = nil
     }
 
     private func saveBookmark(for url: URL) {
@@ -252,6 +284,7 @@ struct SearchBar: View {
     @State private var isFileOptionsExpanded = false
 
     let isSearching: Bool
+    let canStop: Bool
     let onMoveUp: () -> Void
     let onBrowse: () -> Void
     let onRun: () -> Void
@@ -339,10 +372,10 @@ struct SearchBar: View {
                     .disabled(isSearching)
 
                     Button(action: onStop) {
-                        Label("Stop", systemImage: "stop.fill")
-                            .frame(width: 76)
-                    }
-                    .disabled(!isSearching)
+                    Label("Stop", systemImage: "stop.fill")
+                        .frame(width: 76)
+                }
+                .disabled(!canStop)
 
                     Toggle("Case Sensitive", isOn: $caseSensitiveSearch)
                         .toggleStyle(.checkbox)
