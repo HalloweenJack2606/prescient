@@ -263,35 +263,36 @@ struct ContentView: View {
     }
 
     private func resolvedFolderAccess() -> SearchFolderAccess? {
+        let typedURL = URL(fileURLWithPath: folder).standardizedFileURL
+
+        // Use the saved bookmark only when it points at the folder currently in the field;
+        // otherwise a typed path would be ignored and reverted.
         if !folderBookmark.isEmpty {
             var isStale = false
 
-            do {
-                let url = try URL(
-                    resolvingBookmarkData: folderBookmark,
-                    options: .withSecurityScope,
-                    relativeTo: nil,
-                    bookmarkDataIsStale: &isStale
-                )
-
+            if let url = try? URL(
+                resolvingBookmarkData: folderBookmark,
+                options: .withSecurityScope,
+                relativeTo: nil,
+                bookmarkDataIsStale: &isStale
+            ), url.standardizedFileURL.path == typedURL.path {
                 if isStale {
                     saveBookmark(for: url)
                 }
 
                 let didStartAccessing = url.startAccessingSecurityScopedResource()
-                folder = url.path
 
                 return SearchFolderAccess(url: url) {
                     if didStartAccessing {
                         url.stopAccessingSecurityScopedResource()
                     }
                 }
-            } catch {
-                folderBookmark = Data()
             }
         }
 
-        return SearchFolderAccess(url: URL(fileURLWithPath: folder)) {}
+        // Typed path differs from (or has no) bookmark: use it directly and refresh the bookmark.
+        saveBookmark(for: typedURL)
+        return SearchFolderAccess(url: typedURL) {}
     }
 }
 
@@ -306,6 +307,7 @@ struct SearchBar: View {
     @Binding var searchFileNames: Bool
 
     @State private var isFileOptionsExpanded = false
+    @FocusState private var isSearchTextFocused: Bool
 
     let isSearching: Bool
     let canStop: Bool
@@ -380,6 +382,7 @@ struct SearchBar: View {
                     LabeledField(title: "Text") {
                         TextField("Text to find", text: $searchText)
                             .textFieldStyle(.plain)
+                            .focused($isSearchTextFocused)
                             .onSubmit(onRun)
                     }
 
@@ -430,6 +433,15 @@ struct SearchBar: View {
         }
         .padding(12)
         .glassEffect(.regular, in: .rect(cornerRadius: 12))
+        .onAppear {
+            // Focus after the window is key so AppKit actually installs the field
+            // editor (and draws the caret); a declarative default focus leaves a
+            // phantom focus with no visible cursor when the window isn't key yet.
+            DispatchQueue.main.async {
+                NSApp.activate(ignoringOtherApps: true)
+                isSearchTextFocused = true
+            }
+        }
     }
 
     private func addSearchTextField() {
@@ -461,9 +473,11 @@ struct LabeledField<Content: View>: View {
             .frame(width: 44, alignment: .trailing)
 
             content
+                .frame(maxWidth: .infinity, alignment: .leading)
                 .padding(.horizontal, 8)
                 .padding(.vertical, 6)
                 .background(.regularMaterial, in: .rect(cornerRadius: 6))
+                .contentShape(.rect(cornerRadius: 6))
         }
     }
 }
