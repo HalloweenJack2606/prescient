@@ -18,7 +18,7 @@ DD="build/dd"
 VERSION="${1:-$(xcodebuild -project prescient.xcodeproj -scheme "$SCHEME" -showBuildSettings 2>/dev/null | awk '/ MARKETING_VERSION =/{print $3; exit}')}"
 
 echo "==> Building $APP_NAME $VERSION (Release)"
-xcodebuild -project prescient.xcodeproj -scheme "$SCHEME" -configuration Release -derivedDataPath "$DD" build >/dev/null
+xcodebuild -project prescient.xcodeproj -scheme "$SCHEME" -configuration Release -destination "generic/platform=macOS" -derivedDataPath "$DD" build >/dev/null
 
 APP="$DD/Build/Products/Release/$APP_NAME.app"
 [ -d "$APP" ] || { echo "error: $APP not found"; exit 1; }
