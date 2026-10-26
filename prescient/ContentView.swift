@@ -29,6 +29,9 @@ struct ContentView: View {
     @AppStorage("caseSensitiveSearch") private var caseSensitiveSearch = true
     @AppStorage("searchFileNames") private var searchFileNames = false
     @AppStorage("searchFolderBookmark") private var folderBookmark = Data()
+    @AppStorage("workspaces") private var workspacesData = Data()
+    @AppStorage("activeWorkspaceID") private var activeWorkspaceID = ""
+    @State private var workspaces: [Workspace] = []
     @State private var searchText = ""
     @State private var additionalSearchTexts: [SearchTextField] = []
     @State private var results: [GrepResult] = []
@@ -108,9 +111,103 @@ struct ContentView: View {
         }
         .padding(16)
         .frame(minWidth: 900, minHeight: 560)
+        .toolbar {
+            ToolbarItem(placement: .navigation) {
+                WorkspaceMenu(
+                    workspaces: workspaces,
+                    activeID: activeWorkspaceUUID,
+                    onSelect: selectWorkspace,
+                    onCreate: createWorkspace,
+                    onRename: renameActiveWorkspace,
+                    onDelete: deleteActiveWorkspace
+                )
+            }
+        }
+        .onAppear(perform: loadWorkspaces)
+        .onChange(of: currentSettings) { _, settings in
+            guard let index = activeWorkspaceIndex else { return }
+            workspaces[index].settings = settings
+        }
+        .onChange(of: workspaces) { _, workspaces in
+            workspacesData = Workspace.encodeList(workspaces)
+        }
         .onDisappear {
             stopSearch()
         }
+    }
+
+    private var currentSettings: WorkspaceSettings {
+        WorkspaceSettings(
+            folder: folder,
+            folderBookmark: folderBookmark,
+            fileFilter: fileFilter,
+            fileExclusions: fileExclusions,
+            searchSubfolders: searchSubfolders,
+            caseSensitiveSearch: caseSensitiveSearch,
+            searchFileNames: searchFileNames
+        )
+    }
+
+    private var activeWorkspaceUUID: UUID? {
+        UUID(uuidString: activeWorkspaceID)
+    }
+
+    private var activeWorkspaceIndex: Int? {
+        workspaces.firstIndex { $0.id == activeWorkspaceUUID }
+    }
+
+    private func apply(_ settings: WorkspaceSettings) {
+        folder = settings.folder
+        folderBookmark = settings.folderBookmark
+        fileFilter = settings.fileFilter
+        fileExclusions = settings.fileExclusions
+        searchSubfolders = settings.searchSubfolders
+        caseSensitiveSearch = settings.caseSensitiveSearch
+        searchFileNames = settings.searchFileNames
+    }
+
+    private func loadWorkspaces() {
+        workspaces = Workspace.decodeList(workspacesData)
+
+        // NOTE: First launch migrates the existing settings into a "Default" workspace.
+        if workspaces.isEmpty {
+            workspaces = [Workspace(name: "Default", settings: currentSettings)]
+        }
+
+        if activeWorkspaceIndex == nil {
+            activeWorkspaceID = workspaces[0].id.uuidString
+            apply(workspaces[0].settings)
+        }
+    }
+
+    private func selectWorkspace(_ id: Workspace.ID) {
+        guard id != activeWorkspaceUUID, let workspace = workspaces.first(where: { $0.id == id }) else {
+            return
+        }
+
+        stopSearch()
+        results = []
+        searchedFileCount = nil
+        activeWorkspaceID = id.uuidString
+        apply(workspace.settings)
+    }
+
+    private func createWorkspace(named name: String) {
+        let workspace = Workspace(name: name, settings: currentSettings)
+        workspaces.append(workspace)
+        activeWorkspaceID = workspace.id.uuidString
+    }
+
+    private func renameActiveWorkspace(to name: String) {
+        guard let index = activeWorkspaceIndex else { return }
+        workspaces[index].name = name
+    }
+
+    private func deleteActiveWorkspace() {
+        guard workspaces.count > 1, let index = activeWorkspaceIndex else { return }
+
+        workspaces.remove(at: index)
+        selectWorkspace(workspaces[0].id)
     }
 
     private func chooseFolder() {
@@ -265,8 +362,7 @@ struct ContentView: View {
     private func resolvedFolderAccess() -> SearchFolderAccess? {
         let typedURL = URL(fileURLWithPath: folder).standardizedFileURL
 
-        // Use the saved bookmark only when it points at the folder currently in the field;
-        // otherwise a typed path would be ignored and reverted.
+        // NOTE: Only trust the bookmark if it matches the typed folder.
         if !folderBookmark.isEmpty {
             var isStale = false
 
@@ -290,7 +386,6 @@ struct ContentView: View {
             }
         }
 
-        // Typed path differs from (or has no) bookmark: use it directly and refresh the bookmark.
         saveBookmark(for: typedURL)
         return SearchFolderAccess(url: typedURL) {}
     }
@@ -434,9 +529,7 @@ struct SearchBar: View {
         .padding(12)
         .glassEffect(.regular, in: .rect(cornerRadius: 12))
         .onAppear {
-            // Focus after the window is key so AppKit actually installs the field
-            // editor (and draws the caret); a declarative default focus leaves a
-            // phantom focus with no visible cursor when the window isn't key yet.
+            // HACK: Defer focus until the window is key, otherwise no caret is drawn.
             DispatchQueue.main.async {
                 NSApp.activate(ignoringOtherApps: true)
                 isSearchTextFocused = true
