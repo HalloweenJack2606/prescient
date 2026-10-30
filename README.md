@@ -7,7 +7,10 @@ the matched line.
 ## Features
 
 - Recursive folder search with include filters and folder/file exclusions
-- Multiple search terms (AND matching), case-sensitive toggle
+- Multiple search terms (a line matches if it contains any of them)
+- Match case, whole word, and regular expression options, with matches highlighted
+- Recent searches per workspace
+- Export results as text or CSV
 - File-name search mode
 - Opens results in Emacs at the matched line
 - Stop button and live searched-file counting

@@ -7,6 +7,8 @@ final class SearchController {
     private(set) var searchedFileCount: Int?
     private(set) var isSearching = false
     private(set) var isCountingSearchedFiles = false
+    private(set) var matcher: SearchMatcher?
+    private(set) var errorMessage: String?
 
     @ObservationIgnored private var searchTask: Task<Void, Never>?
     @ObservationIgnored private var currentSearchID: UUID?
@@ -16,6 +18,10 @@ final class SearchController {
     }
 
     func summary(fileNamesOnly: Bool) -> String {
+        if let errorMessage {
+            return errorMessage
+        }
+
         let matchingFileCount = Set(results.map(\.filePath)).count
         let countStatus: String
 
@@ -39,6 +45,7 @@ final class SearchController {
 
         let searchID = UUID()
         currentSearchID = searchID
+        matcher = query.matcher
         isSearching = true
 
         searchTask = Task {
@@ -52,7 +59,7 @@ final class SearchController {
                 }
             }
 
-            await withTaskCancellationHandler {
+            let error = await withTaskCancellationHandler {
                 await worker.value
             } onCancel: {
                 worker.cancel()
@@ -61,6 +68,14 @@ final class SearchController {
             guard !Task.isCancelled, currentSearchID == searchID else { return }
 
             isSearching = false
+
+            if let error {
+                errorMessage = error
+                currentSearchID = nil
+                searchTask = nil
+                return
+            }
+
             isCountingSearchedFiles = true
 
             let countWorker = Task.detached(priority: .utility) {
@@ -94,6 +109,13 @@ final class SearchController {
         stop()
         results = []
         searchedFileCount = nil
+        matcher = nil
+        errorMessage = nil
+    }
+
+    func fail(_ message: String) {
+        clear()
+        errorMessage = message
     }
 
     private func append(_ result: GrepResult, for searchID: UUID) {

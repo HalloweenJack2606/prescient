@@ -8,12 +8,15 @@ struct SearchBar: View {
     @State private var isFileOptionsExpanded = false
     @FocusState private var isSearchTextFocused: Bool
 
+    let recentSearches: [RecentSearch]
     let isSearching: Bool
     let canStop: Bool
     let onMoveUp: () -> Void
     let onBrowse: () -> Void
     let onRun: () -> Void
     let onStop: () -> Void
+    let onSelectRecent: (RecentSearch) -> Void
+    let onClearRecent: () -> Void
 
     var body: some View {
         VStack(spacing: 10) {
@@ -79,10 +82,18 @@ struct SearchBar: View {
             VStack(spacing: 8) {
                 HStack(spacing: 10) {
                     LabeledField(title: "Text") {
-                        TextField("Text to find", text: $searchText)
-                            .textFieldStyle(.plain)
-                            .focused($isSearchTextFocused)
-                            .onSubmit(onRun)
+                        HStack(spacing: 4) {
+                            TextField("Text to find", text: $searchText)
+                                .textFieldStyle(.plain)
+                                .focused($isSearchTextFocused)
+                                .onSubmit(onRun)
+
+                            OptionToggle(title: "Aa", help: "Match Case", isOn: $settings.caseSensitiveSearch)
+                            OptionToggle(title: "ab", help: "Match Whole Word", underlined: true, isOn: $settings.wholeWordSearch)
+                            OptionToggle(title: ".*", help: "Use Regular Expression", isOn: $settings.regexSearch)
+
+                            recentSearchesMenu
+                        }
                     }
 
                     Button(action: addSearchTextField) {
@@ -102,9 +113,6 @@ struct SearchBar: View {
                             .frame(width: 76)
                     }
                     .disabled(!canStop)
-
-                    Toggle("Case Sensitive", isOn: $settings.caseSensitiveSearch)
-                        .toggleStyle(.checkbox)
 
                     Toggle("Search File Names", isOn: $settings.searchFileNames)
                         .toggleStyle(.checkbox)
@@ -141,11 +149,72 @@ struct SearchBar: View {
         }
     }
 
+    private var recentSearchesMenu: some View {
+        Menu {
+            if recentSearches.isEmpty {
+                Button("No Recent Searches") {}
+                    .disabled(true)
+            } else {
+                ForEach(Array(recentSearches.enumerated()), id: \.offset) { _, recent in
+                    Button(title(for: recent)) {
+                        onSelectRecent(recent)
+                    }
+                }
+
+                Divider()
+
+                Button("Clear Recent Searches", action: onClearRecent)
+            }
+        } label: {
+            Image(systemName: "clock.arrow.circlepath")
+        }
+        .menuStyle(.borderlessButton)
+        .menuIndicator(.hidden)
+        .fixedSize()
+        .help("Recent searches")
+    }
+
+    private func title(for recent: RecentSearch) -> String {
+        let options = [
+            recent.caseSensitive ? "Aa" : nil,
+            recent.wholeWord ? "Word" : nil,
+            recent.regex ? "Regex" : nil
+        ].compactMap { $0 }
+        let terms = recent.terms.joined(separator: "  ·  ")
+
+        return options.isEmpty ? terms : "\(terms)   [\(options.joined(separator: ", "))]"
+    }
+
     private func addSearchTextField() {
         additionalSearchTexts.append(SearchTextField())
     }
 
     private func removeSearchTextField(_ id: SearchTextField.ID) {
         additionalSearchTexts.removeAll { $0.id == id }
+    }
+}
+
+private struct OptionToggle: View {
+    let title: String
+    let help: String
+    var underlined = false
+    @Binding var isOn: Bool
+
+    var body: some View {
+        Button {
+            isOn.toggle()
+        } label: {
+            Text(title)
+                .underline(underlined)
+                .font(.system(size: 11, weight: .semibold, design: .monospaced))
+                .foregroundStyle(isOn ? Color.white : Color.secondary)
+                .frame(width: 22, height: 18)
+                .background(isOn ? Color.accentColor : Color.clear, in: .rect(cornerRadius: 4))
+                .contentShape(.rect)
+        }
+        .buttonStyle(.plain)
+        .help(help)
+        .accessibilityLabel(help)
+        .accessibilityAddTraits(isOn ? .isSelected : [])
     }
 }

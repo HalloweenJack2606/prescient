@@ -5,19 +5,26 @@ struct SearchQuery: Sendable {
     let filePatterns: FilePatternFilter
     let recursive: Bool
     let caseSensitive: Bool
+    let regex: Bool
+    let wholeWord: Bool
     let fileNamesOnly: Bool
+    let matcher: SearchMatcher
+
+    init(texts: [String], filePatterns: FilePatternFilter, recursive: Bool, caseSensitive: Bool, regex: Bool, wholeWord: Bool, fileNamesOnly: Bool) throws {
+        self.texts = texts
+        self.filePatterns = filePatterns
+        self.recursive = recursive
+        self.caseSensitive = caseSensitive
+        self.regex = regex
+        self.wholeWord = wholeWord
+        self.fileNamesOnly = fileNamesOnly
+        matcher = try SearchMatcher(texts: texts, caseSensitive: caseSensitive, regex: regex, wholeWord: wholeWord)
+    }
 }
 
 enum SearchEngine {
-    nonisolated static func grepCommand(folder: String, filePatterns: FilePatternFilter, texts: [String], recursive: Bool, caseSensitive: Bool) -> String {
-        let folderURL = URL(fileURLWithPath: folder)
-        let arguments = grepArguments(
-            folder: folderURL,
-            filePatterns: filePatterns,
-            texts: texts,
-            recursive: recursive,
-            caseSensitive: caseSensitive
-        )
+    nonisolated static func grepCommand(_ query: SearchQuery, folder: String) -> String {
+        let arguments = grepArguments(query, folder: URL(fileURLWithPath: folder))
 
         guard !arguments.isEmpty else {
             return ""
@@ -28,15 +35,14 @@ enum SearchEngine {
             .joined(separator: " ")
     }
 
-    nonisolated static func fileNameSearchCommand(folder: String, texts: [String], caseSensitive: Bool) -> String {
-        let activeTexts = normalizedSearchTexts(texts, caseSensitive: true)
+    nonisolated static func fileNameSearchCommand(_ query: SearchQuery, folder: String) -> String {
+        let activeTexts = normalizedSearchTexts(query.texts)
 
         guard !folder.isEmpty, !activeTexts.isEmpty else {
             return ""
         }
 
-        let grepArguments = (caseSensitive ? ["-F"] : ["-F", "-i"])
-            + activeTexts.flatMap { ["-e", $0] }
+        let grepArguments = matchOptions(query) + activeTexts.flatMap { ["-e", $0] }
 
         return "\(URL(fileURLWithPath: "/usr/bin/find").path) \(shellQuoted(folder)) -type f | \(URL(fileURLWithPath: "/usr/bin/grep").path) \(grepArguments.map(shellQuoted).joined(separator: " "))"
     }
@@ -45,16 +51,18 @@ enum SearchEngine {
         searchableFiles(folder: folder, filePatterns: filePatterns, recursive: recursive).count
     }
 
+    // NOTE: Returns grep's error message when it fails, e.g. on a pattern it can't parse.
     nonisolated static func run(
         _ query: SearchQuery,
         folder: URL,
         onResult: @escaping @Sendable (GrepResult) async -> Void
-    ) async {
+    ) async -> String? {
         if query.fileNamesOnly {
             await searchFileNames(query, folder: folder, onResult: onResult)
-        } else {
-            await search(query, folder: folder, onResult: onResult)
+            return nil
         }
+
+        return await search(query, folder: folder, onResult: onResult)
     }
 
     private nonisolated static func searchFileNames(
@@ -62,17 +70,10 @@ enum SearchEngine {
         folder: URL,
         onResult: @escaping @Sendable (GrepResult) async -> Void
     ) async {
-        let activeTexts = normalizedSearchTexts(query.texts, caseSensitive: query.caseSensitive)
-
-        guard !activeTexts.isEmpty else {
-            return
-        }
-
         for file in SearchableFiles(folder: folder, filePatterns: query.filePatterns, recursive: query.recursive) {
             let fileName = file.url.lastPathComponent
-            let comparableName = query.caseSensitive ? fileName : fileName.lowercased()
 
-            guard activeTexts.contains(where: { comparableName.contains($0) }) else {
+            guard query.matcher.matches(fileName) else {
                 continue
             }
 
@@ -95,56 +96,48 @@ enum SearchEngine {
         _ query: SearchQuery,
         folder: URL,
         onResult: @escaping @Sendable (GrepResult) async -> Void
-    ) async {
+    ) async -> String? {
         let processBox = GrepProcessBox()
 
-        await withTaskCancellationHandler {
-            await runGrep(
-                folder: folder,
-                filePatterns: query.filePatterns,
-                texts: query.texts,
-                recursive: query.recursive,
-                caseSensitive: query.caseSensitive,
-                processBox: processBox,
-                onResult: onResult
-            )
+        return await withTaskCancellationHandler {
+            await runGrep(query, folder: folder, processBox: processBox, onResult: onResult)
         } onCancel: {
             processBox.terminate()
         }
     }
 
     private nonisolated static func runGrep(
+        _ query: SearchQuery,
         folder: URL,
-        filePatterns: FilePatternFilter,
-        texts: [String],
-        recursive: Bool,
-        caseSensitive: Bool,
         processBox: GrepProcessBox,
         onResult: @escaping @Sendable (GrepResult) async -> Void
-    ) async {
+    ) async -> String? {
         let process = Process()
         let outputPipe = Pipe()
-        let arguments = grepArguments(folder: folder, filePatterns: filePatterns, texts: texts, recursive: recursive, caseSensitive: caseSensitive)
+        let errorPipe = Pipe()
+        let filePatterns = query.filePatterns
+        let arguments = grepArguments(query, folder: folder)
 
         guard !arguments.isEmpty else {
-            return
+            return nil
         }
 
         process.executableURL = URL(fileURLWithPath: "/usr/bin/grep")
         process.arguments = arguments
         process.standardOutput = outputPipe
-        process.standardError = Pipe()
+        process.standardError = errorPipe
 
         do {
             try process.run()
         } catch {
-            return
+            return error.localizedDescription
         }
 
         processBox.set(process)
         defer {
             processBox.clear()
             try? outputPipe.fileHandleForReading.close()
+            try? errorPipe.fileHandleForReading.close()
         }
 
         var partialLine = ""
@@ -171,6 +164,16 @@ enum SearchEngine {
         }
 
         process.waitUntilExit()
+
+        // NOTE: Exit status 2 is a grep error; -s keeps unreadable-file noise out of stderr.
+        guard !Task.isCancelled, process.terminationStatus == 2 else {
+            return nil
+        }
+
+        let message = String(decoding: errorPipe.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+
+        return message.isEmpty ? nil : message
     }
 
     private nonisolated static func emit(
@@ -221,8 +224,10 @@ enum SearchEngine {
         return path
     }
 
-    private nonisolated static func grepArguments(folder: URL, filePatterns: FilePatternFilter, texts: [String], recursive: Bool, caseSensitive: Bool) -> [String] {
-        let activeTexts = normalizedSearchTexts(texts, caseSensitive: true)
+    private nonisolated static func grepArguments(_ query: SearchQuery, folder: URL) -> [String] {
+        let activeTexts = normalizedSearchTexts(query.texts)
+        let filePatterns = query.filePatterns
+        let recursive = query.recursive
 
         guard !activeTexts.isEmpty else {
             return []
@@ -232,17 +237,12 @@ enum SearchEngine {
             "-n",
             "-H",
             "-I",
-            "-F",
             "-s",
             "--line-buffered",
             "--exclude-dir=.git",
             "--exclude-dir=.build",
             "--exclude-dir=DerivedData"
-        ]
-
-        if !caseSensitive {
-            arguments.append("-i")
-        }
+        ] + matchOptions(query)
 
         if recursive {
             arguments.insert("-R", at: 0)
@@ -277,11 +277,16 @@ enum SearchEngine {
         return arguments
     }
 
-    private nonisolated static func normalizedSearchTexts(_ texts: [String], caseSensitive: Bool) -> [String] {
+    private nonisolated static func matchOptions(_ query: SearchQuery) -> [String] {
+        [query.regex ? "-E" : "-F"]
+            + (query.wholeWord ? ["-w"] : [])
+            + (query.caseSensitive ? [] : ["-i"])
+    }
+
+    private nonisolated static func normalizedSearchTexts(_ texts: [String]) -> [String] {
         texts
             .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
             .filter { !$0.isEmpty }
-            .map { caseSensitive ? $0 : $0.lowercased() }
     }
 
     private nonisolated static func shellQuoted(_ value: String) -> String {

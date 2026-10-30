@@ -1,5 +1,6 @@
 import SwiftUI
 import AppKit
+import UniformTypeIdentifiers
 
 struct ContentView: View {
     @State private var workspaces = WorkspaceStore()
@@ -23,26 +24,32 @@ struct ContentView: View {
                 settings: $workspaces.settings,
                 searchText: $searchText,
                 additionalSearchTexts: $additionalSearchTexts,
+                recentSearches: workspaces.recentSearches,
                 isSearching: search.isSearching,
                 canStop: search.canStop,
                 onMoveUp: moveFolderUp,
                 onBrowse: chooseFolder,
                 onRun: runSearch,
-                onStop: search.stop
+                onStop: search.stop,
+                onSelectRecent: applyRecentSearch,
+                onClearRecent: workspaces.clearRecentSearches
             )
 
             HStack {
                 Text(search.summary(fileNamesOnly: settings.searchFileNames))
                     .font(.caption)
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(search.errorMessage == nil ? Color.secondary : Color.red)
 
                 Spacer()
+
+                exportMenu
             }
 
             ResultsTable(
                 results: search.results,
                 settings: $workspaces.settings,
-                searchTexts: activeSearchTexts,
+                matcher: search.matcher,
+                makeQuery: { try? makeQuery() },
                 onRun: runSearch
             )
         }
@@ -56,11 +63,53 @@ struct ContentView: View {
         .onDisappear(perform: search.stop)
     }
 
-    private func runSearch() {
-        let texts = activeSearchTexts
+    private var exportMenu: some View {
+        Menu {
+            Button("Copy All Results") {
+                NSPasteboard.general.clearContents()
+                NSPasteboard.general.setString(ResultsExport.text.render(search.results), forType: .string)
+            }
 
-        guard !texts.isEmpty,
-              let access = FolderAccess.resolve(folder: settings.folder, bookmark: settings.folderBookmark) else {
+            Divider()
+
+            Button("Export as Text…") { export(.text) }
+            Button("Export as CSV…") { export(.csv) }
+        } label: {
+            Label("Export", systemImage: "square.and.arrow.up")
+        }
+        .menuStyle(.borderlessButton)
+        .fixedSize()
+        .disabled(search.results.isEmpty)
+    }
+
+    private func makeQuery() throws -> SearchQuery {
+        try SearchQuery(
+            texts: activeSearchTexts,
+            filePatterns: FilePatternFilter.parse(includes: settings.fileFilter, excludes: settings.fileExclusions),
+            recursive: settings.searchSubfolders,
+            caseSensitive: settings.caseSensitiveSearch,
+            regex: settings.regexSearch,
+            wholeWord: settings.wholeWordSearch,
+            fileNamesOnly: settings.searchFileNames
+        )
+    }
+
+    private func runSearch() {
+        guard !activeSearchTexts.isEmpty else {
+            search.clear()
+            return
+        }
+
+        let query: SearchQuery
+
+        do {
+            query = try makeQuery()
+        } catch {
+            search.fail(error.localizedDescription)
+            return
+        }
+
+        guard let access = FolderAccess.resolve(folder: settings.folder, bookmark: settings.folderBookmark) else {
             search.clear()
             return
         }
@@ -69,16 +118,40 @@ struct ContentView: View {
             workspaces.settings.folderBookmark = FolderAccess.bookmark(for: access.url)
         }
 
-        search.run(
-            SearchQuery(
-                texts: texts,
-                filePatterns: FilePatternFilter.parse(includes: settings.fileFilter, excludes: settings.fileExclusions),
-                recursive: settings.searchSubfolders,
-                caseSensitive: settings.caseSensitiveSearch,
-                fileNamesOnly: settings.searchFileNames
-            ),
-            in: access
+        workspaces.recordSearch(
+            RecentSearch(terms: query.texts, caseSensitive: query.caseSensitive, regex: query.regex, wholeWord: query.wholeWord)
         )
+        search.run(query, in: access)
+    }
+
+    private func applyRecentSearch(_ recent: RecentSearch) {
+        searchText = recent.terms.first ?? ""
+        additionalSearchTexts = recent.terms.dropFirst().map { SearchTextField(text: $0) }
+
+        var settings = settings
+        settings.caseSensitiveSearch = recent.caseSensitive
+        settings.regexSearch = recent.regex
+        settings.wholeWordSearch = recent.wholeWord
+        workspaces.settings = settings
+
+        runSearch()
+    }
+
+    private func export(_ format: ResultsExport) {
+        let results = search.results
+        let panel = NSSavePanel()
+        panel.allowedContentTypes = [format.contentType]
+        panel.nameFieldStringValue = "Prescient Results.\(format.fileExtension)"
+
+        guard panel.runModal() == .OK, let url = panel.url else {
+            return
+        }
+
+        do {
+            try format.render(results).write(to: url, atomically: true, encoding: .utf8)
+        } catch {
+            NSAlert(error: error).runModal()
+        }
     }
 
     private func chooseFolder() {

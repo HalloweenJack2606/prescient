@@ -8,6 +8,8 @@ final class WorkspaceStore {
         static let activeID = "activeWorkspaceID"
     }
 
+    private static let recentSearchLimit = 20
+
     private(set) var workspaces: [Workspace]
     private(set) var activeID: Workspace.ID
 
@@ -39,6 +41,23 @@ final class WorkspaceStore {
             workspaces[activeIndex].settings = newValue
             save()
         }
+    }
+
+    var recentSearches: [RecentSearch] {
+        active.recentSearches
+    }
+
+    func recordSearch(_ search: RecentSearch) {
+        var recent = active.recentSearches
+        recent.removeAll { $0 == search }
+        recent.insert(search, at: 0)
+        workspaces[activeIndex].recentSearches = Array(recent.prefix(Self.recentSearchLimit))
+        save()
+    }
+
+    func clearRecentSearches() {
+        workspaces[activeIndex].recentSearches = []
+        save()
     }
 
     func select(_ id: Workspace.ID) {

@@ -4,27 +4,54 @@ import AppKit
 struct ResultsTable: View {
     let results: [GrepResult]
     @Binding var settings: WorkspaceSettings
-    let searchTexts: [String]
+    let matcher: SearchMatcher?
+    let makeQuery: () -> SearchQuery?
     let onRun: () -> Void
     @State private var selection = Set<GrepResult.ID>()
 
     var body: some View {
         Table(results, selection: $selection) {
             TableColumn("File") { result in
-                resultCell(result.filePath, result: result)
+                resultCell(Text(result.filePath), result: result)
             }
             TableColumn("Line") { result in
-                resultCell(result.line.map(String.init) ?? "", result: result)
+                resultCell(Text(result.line.map(String.init) ?? ""), result: result)
             }
             .width(min: 56, ideal: 56, max: 56)
             TableColumn("Text") { result in
-                resultCell(result.text, result: result)
+                resultCell(Text(highlighted(result.text)), result: result)
             }
+        }
+        .onCopyCommand {
+            let selected = results.filter { selection.contains($0.id) }
+            return selected.isEmpty ? [] : [NSItemProvider(object: ResultsExport.text.render(selected) as NSString)]
         }
     }
 
-    private func resultCell(_ text: String, result: GrepResult) -> some View {
-        Text(text)
+    private func highlighted(_ text: String) -> AttributedString {
+        guard let matcher else {
+            return AttributedString(text)
+        }
+
+        var attributed = AttributedString()
+        var cursor = text.startIndex
+
+        for range in matcher.ranges(in: text) {
+            var match = AttributedString(String(text[range]))
+            match.swiftUI.backgroundColor = .yellow.opacity(0.4)
+            match.swiftUI.font = .body.bold()
+
+            attributed += AttributedString(String(text[cursor..<range.lowerBound]))
+            attributed += match
+            cursor = range.upperBound
+        }
+
+        attributed += AttributedString(String(text[cursor...]))
+        return attributed
+    }
+
+    private func resultCell(_ text: Text, result: GrepResult) -> some View {
+        text
             .contentShape(Rectangle())
             .contextMenu {
                 Button {
@@ -137,27 +164,14 @@ struct ResultsTable: View {
     }
 
     private func copyGrepCommand() {
-        if settings.searchFileNames {
-            copy(
-                SearchEngine.fileNameSearchCommand(
-                    folder: settings.folder,
-                    texts: searchTexts,
-                    caseSensitive: settings.caseSensitiveSearch
-                )
-            )
+        guard let query = makeQuery() else {
             return
         }
 
-        let filePatterns = FilePatternFilter.parse(includes: settings.fileFilter, excludes: settings.fileExclusions)
-
         copy(
-            SearchEngine.grepCommand(
-                folder: settings.folder,
-                filePatterns: filePatterns,
-                texts: searchTexts,
-                recursive: settings.searchSubfolders,
-                caseSensitive: settings.caseSensitiveSearch
-            )
+            query.fileNamesOnly
+                ? SearchEngine.fileNameSearchCommand(query, folder: settings.folder)
+                : SearchEngine.grepCommand(query, folder: settings.folder)
         )
     }
 
